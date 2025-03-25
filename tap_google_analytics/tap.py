@@ -42,6 +42,11 @@ class TapGoogleAnalytics(Tap):
             "property_id",
             th.StringType,
             description="Google Analytics Property ID",
+        ),
+        th.Property(
+            "property_ids",
+            th.StringType,
+            description="List of Google Analytics Property IDs",
             required=True,
         ),
         # Service Account
@@ -176,11 +181,19 @@ class TapGoogleAnalytics(Tap):
             as the value. e.g. metrics['sessions'] == INTEGER
 
         """
-        request = GetMetadataRequest(name=f"properties/{self.config['property_id']}/metadata")
+        property_id = None
+        if self.config.get("property_ids"):
+            property_id = self.config["property_ids"].split(",")[0].strip()
+        elif self.config.get("property_id"):
+            property_id = self.config["property_id"]
+        
+        if not property_id:
+            raise RuntimeError("No valid property ID provided")
+
+        request = GetMetadataRequest(name=f"properties/{property_id}/metadata")
         results = self.analytics.get_metadata(request)
 
-        prop_id = self.config["property_id"]
-        LOGGER.debug("**** metadata for %s", prop_id)
+        LOGGER.debug("**** metadata for %s", property_id)
         LOGGER.debug(results)
 
         metrics = {

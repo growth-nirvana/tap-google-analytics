@@ -43,7 +43,11 @@ class GoogleAnalyticsStream(Stream):
         super().__init__(*args, **kwargs)
 
         self.end_date = self._get_end_date()
-        self.property_id = self.config["property_id"]
+        # Get property IDs from either source
+        if self.config.get("property_ids"):
+            self.property_ids = [pid.strip() for pid in self.config["property_ids"].split(",")]
+        elif self.config.get("property_id"):
+            self.property_ids = [self.config["property_id"]]
         self.page_size = 100000
         self.quota_manager = QuotaManager()
 
@@ -151,8 +155,11 @@ class GoogleAnalyticsStream(Stream):
 
         # state bookmarks need to be reformatted for API requests
         return date.strftime(parsed, "%Y-%m-%d")
+        
 
     def _request_records(self, context: Context | None) -> t.Iterable[dict]:
+        """Request records from multiple properties."""
+
         """Request records from REST endpoint(s), returning response records.
 
         If pagination is detected, pages will be recursed automatically.
@@ -167,32 +174,43 @@ class GoogleAnalyticsStream(Stream):
             RuntimeError: If a loop in pagination is detected. That is, when two
                 consecutive pagination tokens are identical.
         """
-        next_page_token: t.Any = None
-        finished = False
 
+        # Get all property IDs
+        property_ids = []
+        if self.config.get("property_ids"):
+            property_ids = [pid.strip() for pid in self.config["property_ids"].split(",")]
+        if self.config.get("property_id"):  # backward compatibility
+            property_ids.append(self.config["property_id"])
+        
         state_filter = self._get_state_filter(context)
         api_report_def = self._generate_report_definition(self.report)
-        while not finished:
-            resp = self._request_data(
-                api_report_def,
-                state_filter=state_filter,
-                next_page_token=next_page_token,
-            )
 
-            yield from self._parse_response(resp)
+        # Fetch data for each property
+        for property_id in property_ids:
+            self.property_id = property_id  # Set current property_id for API calls
+            next_page_token: t.Any = None
+            finished = False
 
-            previous_token = copy.deepcopy(next_page_token)
-            next_page_token = self._get_next_page_token(
-                response=resp, previous_token=previous_token
-            )
-            if next_page_token and next_page_token == previous_token:
-                msg = (
-                    f"Loop detected in pagination. "
-                    f"Pagination token {next_page_token} is identical to prior token."
+            while not finished:
+                resp = self._request_data(
+                    api_report_def,
+                    state_filter=state_filter,
+                    next_page_token=next_page_token,
                 )
-                raise RuntimeError(msg)
-            # Cycle until get_next_page_token() no longer returns a value
-            finished = not next_page_token
+
+                yield from self._parse_response(resp)
+
+                previous_token = copy.deepcopy(next_page_token)
+                next_page_token = self._get_next_page_token(
+                    response=resp, previous_token=previous_token
+                )
+                if next_page_token and next_page_token == previous_token:
+                    msg = (
+                        f"Loop detected in pagination. "
+                        f"Pagination token {next_page_token} is identical to prior token."
+                    )
+                    raise RuntimeError(msg)
+                finished = not next_page_token
 
     def _get_next_page_token(self, response: RunReportResponse, previous_token) -> t.Any:
         """Get the next page token from a response.
