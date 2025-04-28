@@ -382,7 +382,9 @@ class GoogleAnalyticsStream(Stream):
                 "metric", metric, self.dimensions_ref, self.metrics_ref
             )
             properties.append(th.Property(metric, self._get_datatype(data_type)))
-            primary_keys.append("property_id")
+
+        # Add property_id to primary keys once
+        primary_keys.append("property_id")
 
         properties.extend(
             (
