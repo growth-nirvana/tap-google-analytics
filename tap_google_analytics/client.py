@@ -258,7 +258,10 @@ class GoogleAnalyticsStream(Stream):
                     "dimension", header, self.dimensions_ref, self.metrics_ref
                 )
 
-                if data_type == "integer":
+                # Convert empty strings to "(no value)", preserve "(not set)" values
+                if not dimension and dimension != "(not set)":
+                    value = "(no value)"
+                elif data_type == "integer":
                     value = int(dimension)
                 elif data_type == "number":
                     value = float(dimension)
@@ -275,7 +278,10 @@ class GoogleAnalyticsStream(Stream):
                 if hasattr(value, "value"):
                     value = value.value  # noqa: PLW2901
 
-                if metric_type == "integer":
+                # Convert empty strings to "(no value)", preserve "(not set)" values for metrics
+                if not value and value != "(not set)":
+                    value = "(no value)"
+                elif metric_type == "integer":
                     value = int(value)  # noqa: PLW2901
                 elif metric_type == "number":
                     value = float(value)  # noqa: PLW2901
