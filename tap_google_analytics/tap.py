@@ -132,7 +132,6 @@ class TapGoogleAnalytics(Tap):
                 }
             )
 
-
         if self.config.get("key_file_location"):
             with open(self.config["key_file_location"]) as f:  # noqa: PTH123
                 return service_account.Credentials.from_service_account_info(json.load(f))

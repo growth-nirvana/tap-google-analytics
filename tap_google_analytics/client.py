@@ -53,14 +53,17 @@ class GoogleAnalyticsStream(Stream):
 
     def _get_end_date(self):
         end_date_config = self.config.get("end_date")
-        end_date = (
-            datetime.strptime(end_date_config, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-            if end_date_config
-            else datetime.now(timezone.utc)
-        )
-        end_date_offset = end_date - timedelta(days=1)
-
-        return end_date_offset.strftime("%Y-%m-%d")
+        if not end_date_config:
+            return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            
+        try:
+            # Try parsing as ISO format first
+            parsed = datetime.fromisoformat(end_date_config.replace('Z', '+00:00'))
+        except ValueError:
+            # If that fails, try parsing as YYYY-MM-DD
+            parsed = datetime.strptime(end_date_config, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            
+        return parsed.strftime("%Y-%m-%d")
 
     def _parse_dimension_type(self, attribute, dimensions_ref):
         if attribute in dimensions_ref:
@@ -150,9 +153,21 @@ class GoogleAnalyticsStream(Stream):
     def _get_state_filter(self, context: Context | None) -> str:
         state = self.get_context_state(context)
         state_bookmark = state.get("replication_key_value") or self.config["start_date"]
-        parsed = date.fromisoformat(state_bookmark)
+        
+        # Handle both YYYY-MM-DD and ISO format dates
+        try:
+            # Try parsing as ISO format first
+            parsed = datetime.fromisoformat(state_bookmark.replace('Z', '+00:00')).date()
+        except ValueError:
+            # If that fails, try parsing as YYYY-MM-DD
+            parsed = date.fromisoformat(state_bookmark)
+        
         parsed = max(parsed, date(2019, 1, 1))
-
+        
+        # Only apply lookback window if we have a state bookmark
+        if state.get("replication_key_value"):
+            parsed = parsed - timedelta(days=30)
+        
         # state bookmarks need to be reformatted for API requests
         return date.strftime(parsed, "%Y-%m-%d")
         
