@@ -104,6 +104,12 @@ class TapGoogleAnalytics(Tap):
                         th.ArrayType(th.StringType),
                         description="Google Analytics Metrics",
                     ),
+                    th.Property(
+                        "monthly_aggregation",
+                        th.BooleanType,
+                        description="Whether to aggregate data by month. If true, will automatically add year and month dimensions and combine them into year_month.",
+                        default=False,
+                    ),
                 ),
             ),
             description="List of Google Analytics Reports Definitions",
