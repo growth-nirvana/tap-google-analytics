@@ -138,6 +138,12 @@ class GoogleAnalyticsStream(Stream):
             "dimensionFilter": None,
         }
 
+        # Handle monthly aggregation if enabled
+        if report_def_raw.get("monthly_aggregation", False):
+            # Add yearMonth dimension if not already present
+            if "yearMonth" not in report_def_raw["dimensions"]:
+                report_def_raw["dimensions"].append("yearMonth")
+
         for dimension in report_def_raw["dimensions"]:
             report_definition["dimensions"].append({"name": dimension})
 
@@ -176,8 +182,11 @@ class GoogleAnalyticsStream(Stream):
         
         parsed = max(parsed, date(2019, 1, 1))
         
-        # Only apply lookback window if we have a state bookmark
-        if state.get("replication_key_value"):
+        # For initial sync (no state), floor to first of month
+        if not state.get("replication_key_value"):
+            parsed = date(parsed.year, parsed.month, 1)
+        else:
+            # For incremental sync, apply lookback window
             parsed = parsed - timedelta(days=30)
         
         # state bookmarks need to be reformatted for API requests
@@ -381,7 +390,6 @@ class GoogleAnalyticsStream(Stream):
         """
         properties: list[th.Property] = []
         primary_keys = []
-        # : List[th.StringType] = []
 
         # Track if there is a date set as one of the Dimensions
         date_dimension_included = False
