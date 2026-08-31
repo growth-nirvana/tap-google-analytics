@@ -53,7 +53,11 @@ class GoogleAnalyticsStream(Stream):
         elif self.config.get("property_id"):
             self.property_ids = [self.config["property_id"]]
         self.page_size = 100000
-        self.quota_manager = QuotaManager()
+        tap = getattr(self, "_tap", None)
+        self.quota_manager = getattr(tap, "quota_manager", None) or QuotaManager(
+            min_request_interval=float(self.config.get("request_delay_seconds", 0.5)),
+            max_hourly_retries=int(self.config.get("quota_max_hourly_retries", 24)),
+        )
 
         # Generate a unique run_id for this tap run if not already set
         if GoogleAnalyticsStream._shared_run_id is None:
@@ -326,41 +330,29 @@ class GoogleAnalyticsStream(Stream):
     @backoff.on_exception(backoff.expo, (Exception), max_tries=5, giveup=is_fatal_error)
     def _query_api(self, report_definition, state_filter, pageToken=None) -> RunReportResponse:
         """Query the Analytics Reporting API V4."""
-        max_retries = 24  # Maximum number of hourly retries (e.g., 24 hours)
-        retry_count = 0
-        
-        while True:
-            try:
-                request = RunReportRequest(
-                    property=f"properties/{self.property_id}",
-                    dimensions=report_definition["dimensions"],
-                    metrics=report_definition["metrics"],
-                    date_ranges=[DateRange(start_date=state_filter, end_date=self.end_date)],
-                    limit=self.page_size,
-                    metric_filter=report_definition["metricFilter"],
-                    dimension_filter=report_definition["dimensionFilter"],
-                    offset=(pageToken or 0) * self.page_size,
-                )
+        request = RunReportRequest(
+            property=f"properties/{self.property_id}",
+            dimensions=report_definition["dimensions"],
+            metrics=report_definition["metrics"],
+            date_ranges=[DateRange(start_date=state_filter, end_date=self.end_date)],
+            limit=self.page_size,
+            metric_filter=report_definition["metricFilter"],
+            dimension_filter=report_definition["dimensionFilter"],
+            offset=(pageToken or 0) * self.page_size,
+            return_property_quota=True,
+        )
 
-                return self.analytics.run_report(request)
-
-            except Exception as e:
-                if is_quota_error(e):
-                    retry_count += 1
-                    if retry_count > max_retries:
-                        raise Exception(
-                            f"Exceeded maximum retries ({max_retries}) waiting for quota reset. "
-                            "Please check your GA4 quota settings."
-                        )
-                        
-                    self.logger.info(
-                        f"Quota exceeded (attempt {retry_count}/{max_retries}), waiting for reset..."
-                    )
-                    self.quota_manager.wait_for_quota_reset()
-                    continue
+        try:
+            return self.quota_manager.call(self.analytics.run_report, request)
+        except Exception as e:
+            if is_quota_error(e):
                 raise RuntimeError(
-                    f"Property ID '{self.property_id}': {e}"
+                    f"Exceeded maximum retries waiting for GA4 quota reset on property "
+                    f"'{self.property_id}'. Last error: {e}"
                 ) from e
+            raise RuntimeError(
+                f"Property ID '{self.property_id}': {e}"
+            ) from e
 
     @staticmethod
     def _get_datatype(string_type):

@@ -9,9 +9,13 @@ import socket
 
 try:
     from google.api_core.exceptions import PermissionDenied as GooglePermissionDenied
+    from google.api_core.exceptions import ResourceExhausted as GoogleResourceExhausted
 except ImportError:
-    # Fallback so no exception is ever considered PermissionDenied
+    # Fallback so no exception is ever considered PermissionDenied / quota
     class GooglePermissionDenied(Exception):
+        pass
+
+    class GoogleResourceExhausted(Exception):
         pass
 
 
@@ -47,9 +51,33 @@ NON_FATAL_ERRORS = [
     "userRateLimitExceeded",
     "rateLimitExceeded",
     "quotaExceeded",
+    "dailyQuotaExceeded",
     "internalServerError",
     "backendError",
 ]
+
+QUOTA_REASONS = [
+    "quotaExceeded",
+    "dailyQuotaExceeded",
+    "userRateLimitExceeded",
+    "rateLimitExceeded",
+]
+
+# Hourly project/property token exhaustion. Waiting until the next hour helps.
+HOURLY_QUOTA_MARKERS = (
+    "exhausted property tokens",
+    "tokens for a project per hour",
+    "tokens per hour",
+    "per hour",
+)
+
+RATE_LIMIT_MARKERS = (
+    "userratelimitexceeded",
+    "ratelimitexceeded",
+    "rate limit",
+    "too many requests",
+    "concurrent",
+)
 
 
 def error_reason(e):
@@ -76,6 +104,7 @@ def error_reason(e):
 LOGGER = logging.getLogger("googleapiclient.discovery_cache")
 LOGGER.setLevel(logging.ERROR)
 
+
 def is_permission_denied_error(error):
     """Return True if error indicates lack of access to a GA property."""
     if isinstance(error, GooglePermissionDenied):
@@ -87,25 +116,69 @@ def is_permission_denied_error(error):
 
 
 def is_quota_error(error):
-    """Return True if error is related to quota exhaustion."""
+    """Return True if error is related to quota exhaustion or rate limiting."""
+    if isinstance(error, GoogleResourceExhausted):
+        return True
+
     reason = error_reason(error)
     error_message = str(error).lower()
-    
-    # Check both the reason code and error message content
-    return (reason in ["quotaExceeded", "dailyQuotaExceeded", "userRateLimitExceeded"] or
-            "exhausted property tokens" in error_message or
-            "quota exceeded" in error_message)
+    status = getattr(error, "code", None)
+
+    return (
+        reason in QUOTA_REASONS
+        or status == 429
+        or "exhausted property tokens" in error_message
+        or "quota exceeded" in error_message
+        or "quota tokens" in error_message
+        or "resource has been exhausted" in error_message
+        or "resourceexhausted" in error_message
+        or "rate limit" in error_message
+        or "too many requests" in error_message
+        or "concurrent request" in error_message
+    )
+
+
+def classify_quota_error(error) -> str:
+    """Classify a quota error so callers can choose a wait strategy.
+
+    Returns one of: ``daily_tokens``, ``hourly_tokens``, ``rate_limit``, ``unknown``.
+    """
+    reason = (error_reason(error) or "").lower()
+    error_message = str(error).lower()
+    combined = f"{reason} {error_message}"
+
+    if reason == "dailyquotaexceeded" or "dailyquota" in combined or "tokens per day" in combined:
+        return "daily_tokens"
+
+    if any(marker in combined for marker in HOURLY_QUOTA_MARKERS):
+        return "hourly_tokens"
+
+    if reason in {"userratelimitexceeded", "ratelimitexceeded"} or any(
+        marker in combined for marker in RATE_LIMIT_MARKERS
+    ):
+        return "rate_limit"
+
+    if is_quota_error(error):
+        # Default 429 / ResourceExhausted without a more specific message to hourly
+        # tokens — that is the most common GA4 Data API exhaustion case.
+        return "hourly_tokens"
+
+    return "unknown"
+
 
 def is_fatal_error(error):
     """Return a boolean value depending on if its a fatal error or not."""
     if isinstance(error, socket.timeout):
         return False
 
+    if is_quota_error(error):
+        return False
+
     # Google API exceptions have .message and .code; plain exceptions (e.g. RuntimeError)
     # do not - use getattr to avoid AttributeError.
     message = getattr(error, "message", None)
     status = getattr(error, "code", None) if message is not None else None
-    if status in [500, 503]:
+    if status in [429, 500, 503]:
         return False
 
     # Use list of errors defined in:

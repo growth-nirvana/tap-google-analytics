@@ -21,7 +21,8 @@ from singer_sdk import typing as th  # JSON schema typing helpers
 from datetime import datetime, timedelta, timezone
 
 from tap_google_analytics.client import GoogleAnalyticsStream
-from tap_google_analytics.error import is_permission_denied_error
+from tap_google_analytics.error import is_permission_denied_error, is_quota_error
+from tap_google_analytics.quota_manager import QuotaManager
 
 SCOPES = ["https://www.googleapis.com/auth/analytics.readonly"]
 
@@ -121,6 +122,36 @@ class TapGoogleAnalytics(Tap):
             description="The last record date to sync",
             default=_end_date.isoformat(),
         ),
+        th.Property(
+            "request_delay_seconds",
+            th.NumberType,
+            description=(
+                "Minimum seconds to wait between GA4 API requests. Helps avoid "
+                "burning the shared project hourly token quota."
+            ),
+            default=0.5,
+        ),
+        th.Property(
+            "quota_max_hourly_retries",
+            th.IntegerType,
+            description=(
+                "How many times to wait for the next clock hour when the GA4 "
+                "hourly token quota is exhausted during sync."
+            ),
+            default=24,
+        ),
+        th.Property(
+            "quota_metadata_max_hourly_retries",
+            th.IntegerType,
+            description=(
+                "How many hourly quota waits to attempt while fetching GA4 "
+                "metadata during discovery. Default 0 keeps discover fast: after "
+                "the first hourly-token error, field types are inferred from the "
+                "report definition so catalog generation can still succeed. "
+                "Set to 1 to wait until the next hour for live metadata instead."
+            ),
+            default=0,
+        ),
     ).to_dict()
 
     def _initialize_credentials(self):
@@ -200,16 +231,28 @@ class TapGoogleAnalytics(Tap):
         if not property_ids:
             raise RuntimeError("No valid property ID provided")
 
+        metadata_hourly_retries = int(self.config.get("quota_metadata_max_hourly_retries", 0))
         last_error = None
         for property_id in property_ids:
             request = GetMetadataRequest(name=f"properties/{property_id}/metadata")
             try:
-                results = self.analytics.get_metadata(request)
+                results = self.quota_manager.call(
+                    self.analytics.get_metadata,
+                    request,
+                    max_hourly_retries=metadata_hourly_retries,
+                )
             except Exception as e:
                 last_error = e
                 if is_permission_denied_error(e):
                     self.logger.warning(
                         "Skipping property ID %s (no access): %s",
+                        property_id,
+                        e,
+                    )
+                    continue
+                if is_quota_error(e):
+                    self.logger.warning(
+                        "GA4 quota exhausted fetching metadata for property %s: %s",
                         property_id,
                         e,
                     )
@@ -228,10 +271,52 @@ class TapGoogleAnalytics(Tap):
             dimensions = {dimension.api_name: "string" for dimension in results.dimensions}
             return dimensions, metrics
 
+        if last_error is not None and is_quota_error(last_error):
+            self.logger.warning(
+                "Could not fetch GA4 metadata due to quota limits (tried %s). "
+                "Inferring field types from the report definition so discovery can continue. "
+                "Last error: %s",
+                ", ".join(property_ids),
+                last_error,
+            )
+            return self._infer_metadata_from_reports()
+
         raise RuntimeError(
             "No property accessible. Tried: %s. Last error: %s"
             % (", ".join(property_ids), last_error)
         )
+
+    @staticmethod
+    def _infer_metric_type(metric_name: str) -> str:
+        """Best-effort GA4 metric type when the Metadata API is unavailable."""
+        normalized = metric_name.lower().replace("_", "")
+        number_markers = (
+            "rate",
+            "revenue",
+            "value",
+            "average",
+            "avg",
+            "duration",
+            "percent",
+            "ratio",
+            "peruser",
+            "persession",
+        )
+        if any(marker in normalized for marker in number_markers):
+            return "number"
+        return "integer"
+
+    def _infer_metadata_from_reports(self) -> tuple[dict, dict]:
+        """Build dimension/metric type maps from the configured report definitions."""
+        reports = getattr(self, "reports_definition", None) or self._get_reports_config()
+        dimensions: dict[str, str] = {}
+        metrics: dict[str, str] = {}
+        for report in reports:
+            for dimension in report.get("dimensions", []):
+                dimensions[dimension] = "string"
+            for metric in report.get("metrics", []):
+                metrics[metric] = self._infer_metric_type(metric)
+        return dimensions, metrics
 
     def _validate_report_def(self, reports_definition):
         for report in reports_definition:
@@ -318,9 +403,13 @@ class TapGoogleAnalytics(Tap):
         # init GA client
         self.credentials = self._initialize_credentials()
         self.analytics = self._initialize_analytics()
-        # load and validate reports
-        self.dimensions_ref, self.metrics_ref = self._fetch_valid_api_metadata()
+        self.quota_manager = QuotaManager(
+            min_request_interval=float(self.config.get("request_delay_seconds", 0.5)),
+            max_hourly_retries=int(self.config.get("quota_max_hourly_retries", 24)),
+        )
+        # Load reports first so metadata fetch can fall back to inferred types.
         self.reports_definition = self._get_reports_config()
+        self.dimensions_ref, self.metrics_ref = self._fetch_valid_api_metadata()
         self._validate_report_def(self.reports_definition)
 
     def discover_streams(self) -> list[Stream]:
