@@ -22,6 +22,7 @@ from singer_sdk.streams import Stream
 from tap_google_analytics.error import is_fatal_error
 from tap_google_analytics.error import is_permission_denied_error
 from tap_google_analytics.error import is_quota_error
+from tap_google_analytics.property_ids import get_configured_property_ids
 from tap_google_analytics.quota_manager import QuotaManager
 if t.TYPE_CHECKING:
     from singer_sdk.helpers.types import Context
@@ -47,11 +48,7 @@ class GoogleAnalyticsStream(Stream):
         super().__init__(*args, **kwargs)
 
         self.end_date = self._get_end_date()
-        # Get property IDs from either source
-        if self.config.get("property_ids"):
-            self.property_ids = [pid.strip() for pid in self.config["property_ids"].split(",")]
-        elif self.config.get("property_id"):
-            self.property_ids = [self.config["property_id"]]
+        self.property_ids = get_configured_property_ids(self.config)
         self.page_size = 100000
         tap = getattr(self, "_tap", None)
         self.quota_manager = getattr(tap, "quota_manager", None) or QuotaManager(
@@ -207,13 +204,8 @@ class GoogleAnalyticsStream(Stream):
                 consecutive pagination tokens are identical.
         """
 
-        # Get all property IDs
-        property_ids = []
-        if self.config.get("property_ids"):
-            property_ids = [pid.strip() for pid in self.config["property_ids"].split(",")]
-        if self.config.get("property_id"):  # backward compatibility
-            property_ids.append(self.config["property_id"])
-        
+        property_ids = get_configured_property_ids(self.config)
+
         state_filter = self._get_state_filter(context)
         api_report_def = self._generate_report_definition(self.report)
 

@@ -22,6 +22,7 @@ from datetime import datetime, timedelta, timezone
 
 from tap_google_analytics.client import GoogleAnalyticsStream
 from tap_google_analytics.error import is_permission_denied_error, is_quota_error
+from tap_google_analytics.property_ids import get_configured_property_ids
 from tap_google_analytics.quota_manager import QuotaManager
 
 SCOPES = ["https://www.googleapis.com/auth/analytics.readonly"]
@@ -221,13 +222,7 @@ class TapGoogleAnalytics(Tap):
             as the value. e.g. metrics['sessions'] == INTEGER
 
         """
-        property_ids = []
-        if self.config.get("property_ids"):
-            property_ids = [pid.strip() for pid in self.config["property_ids"].split(",")]
-        if self.config.get("property_id"):
-            pid = self.config["property_id"].strip()
-            if pid not in property_ids:
-                property_ids.append(pid)
+        property_ids = get_configured_property_ids(self.config)
         if not property_ids:
             raise RuntimeError("No valid property ID provided")
 
