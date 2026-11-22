@@ -24,6 +24,7 @@ from tap_google_analytics.client import GoogleAnalyticsStream
 from tap_google_analytics.error import is_permission_denied_error, is_quota_error
 from tap_google_analytics.property_ids import get_configured_property_ids
 from tap_google_analytics.quota_manager import QuotaManager
+from tap_google_analytics.time_dimensions import TIME_DIMENSIONS
 
 SCOPES = ["https://www.googleapis.com/auth/analytics.readonly"]
 
@@ -112,6 +113,17 @@ class TapGoogleAnalytics(Tap):
             description="List of Google Analytics Reports Definitions",
         ),
         th.Property(
+            "merge_default_reports",
+            th.BooleanType,
+            description=(
+                "When true and `reports_list` is set, sync the default reports (or the "
+                "`reports` file) plus `reports_list`. A report in `reports_list` with the "
+                "same name as a default report replaces it. When false, `reports_list` "
+                "replaces the defaults."
+            ),
+            default=False,
+        ),
+        th.Property(
             "start_date",
             th.DateTimeType,
             description="The earliest record date to sync",
@@ -186,9 +198,23 @@ class TapGoogleAnalytics(Tap):
         return BetaAnalyticsDataClient(credentials=self.credentials)
 
     def _get_reports_config(self):
-        if self.config.get("reports_list"):
-            return self.config["reports_list"]
+        reports_list = self.config.get("reports_list")
+        if not reports_list:
+            return self._load_report_file()
 
+        if not self.config.get("merge_default_reports"):
+            return reports_list
+
+        # Defaults first (in file order), a custom report with the same name
+        # replaces its default, then the remaining custom reports.
+        custom_by_name = {report.get("name"): report for report in reports_list}
+        merged = [
+            custom_by_name.pop(report.get("name"), report) for report in self._load_report_file()
+        ]
+        merged.extend(report for report in reports_list if report.get("name") in custom_by_name)
+        return merged
+
+    def _load_report_file(self):
         default_reports = Path(__file__).parent.joinpath(
             "defaults", "default_report_definition.json"
         )
@@ -208,9 +234,10 @@ class TapGoogleAnalytics(Tap):
     def _fetch_valid_api_metadata(self) -> tuple[dict, dict]:
         """Fetch the valid (dimensions, metrics) for the Analytics Reporting API.
 
-        Tries each configured property in turn; skips properties without access
-        and uses the first one that succeeds. Metadata is the same for all GA4
-        properties.
+        Fetches metadata for every configured property, skipping properties
+        without access. Custom dimensions/metrics (customEvent:, keyEvents:<event>,
+        ...) differ per property, so the result is the union across properties
+        and the per-property maps are kept in ``self.property_metadata``.
 
         Returns:
           A map of (dimensions, metrics) hashes
@@ -228,6 +255,8 @@ class TapGoogleAnalytics(Tap):
 
         metadata_hourly_retries = int(self.config.get("quota_metadata_max_hourly_retries", 0))
         last_error = None
+        quota_failed = False
+        property_metadata: dict[str, tuple[dict, dict]] = {}
         for property_id in property_ids:
             request = GetMetadataRequest(name=f"properties/{property_id}/metadata")
             try:
@@ -246,6 +275,7 @@ class TapGoogleAnalytics(Tap):
                     )
                     continue
                 if is_quota_error(e):
+                    quota_failed = True
                     self.logger.warning(
                         "GA4 quota exhausted fetching metadata for property %s: %s",
                         property_id,
@@ -264,22 +294,54 @@ class TapGoogleAnalytics(Tap):
                 for metric in results.metrics
             }
             dimensions = {dimension.api_name: "string" for dimension in results.dimensions}
-            return dimensions, metrics
+            property_metadata[property_id] = (dimensions, metrics)
 
-        if last_error is not None and is_quota_error(last_error):
-            self.logger.warning(
-                "Could not fetch GA4 metadata due to quota limits (tried %s). "
-                "Inferring field types from the report definition so discovery can continue. "
-                "Last error: %s",
-                ", ".join(property_ids),
-                last_error,
+        self.property_metadata = property_metadata
+
+        if not property_metadata:
+            if last_error is not None and is_quota_error(last_error):
+                self.logger.warning(
+                    "Could not fetch GA4 metadata due to quota limits (tried %s). "
+                    "Inferring field types from the report definition so discovery can "
+                    "continue. Last error: %s",
+                    ", ".join(property_ids),
+                    last_error,
+                )
+                return self._infer_metadata_from_reports()
+
+            raise RuntimeError(
+                "No property accessible. Tried: %s. Last error: %s"
+                % (", ".join(property_ids), last_error)
             )
-            return self._infer_metadata_from_reports()
 
-        raise RuntimeError(
-            "No property accessible. Tried: %s. Last error: %s"
-            % (", ".join(property_ids), last_error)
-        )
+        dimensions: dict[str, str] = {}
+        metrics: dict[str, str] = {}
+        for property_dimensions, property_metrics in property_metadata.values():
+            for name, field_type in property_dimensions.items():
+                dimensions[name] = self._merge_field_type(dimensions.get(name), field_type)
+            for name, field_type in property_metrics.items():
+                metrics[name] = self._merge_field_type(metrics.get(name), field_type)
+
+        if quota_failed:
+            # Properties without metadata get the full field list, so their
+            # custom fields must pass validation too. Live types win.
+            inferred_dimensions, inferred_metrics = self._infer_metadata_from_reports()
+            for name, field_type in inferred_dimensions.items():
+                dimensions.setdefault(name, field_type)
+            for name, field_type in inferred_metrics.items():
+                metrics.setdefault(name, field_type)
+
+        return dimensions, metrics
+
+    @staticmethod
+    def _merge_field_type(existing: str | None, new: str) -> str:
+        """Combine a field's type across properties (custom metrics can differ)."""
+        if existing is None or existing == new:
+            return new
+        numeric = {"integer", "float", "percent", "time", "seconds"}
+        if existing in numeric and new in numeric:
+            return "float"
+        return "string"
 
     @staticmethod
     def _infer_metric_type(metric_name: str) -> str:
@@ -348,6 +410,17 @@ class TapGoogleAnalytics(Tap):
                 )
                 sys.exit(1)
 
+            time_dimensions = [d for d in dimensions if d in TIME_DIMENSIONS]
+            if len(time_dimensions) > 1:
+                self.logger.critical(
+                    "'%s' has more than one time dimension (%s). GA reports can use only "
+                    "one of %s.",
+                    name,
+                    ", ".join(time_dimensions),
+                    ", ".join(TIME_DIMENSIONS),
+                )
+                sys.exit(1)
+
             self._validate_dimensions(dimensions)
             self._validate_metrics(metrics)
 
@@ -404,6 +477,7 @@ class TapGoogleAnalytics(Tap):
         )
         # Load reports first so metadata fetch can fall back to inferred types.
         self.reports_definition = self._get_reports_config()
+        self.property_metadata = {}
         self.dimensions_ref, self.metrics_ref = self._fetch_valid_api_metadata()
         self._validate_report_def(self.reports_definition)
 
@@ -420,6 +494,7 @@ class TapGoogleAnalytics(Tap):
                 ga_report=report,
                 ga_dimensions_ref=self.dimensions_ref,
                 ga_metrics_ref=self.metrics_ref,
+                ga_property_metadata=self.property_metadata,
                 ga_analytics_client=self.analytics,
             )
             stream_list.append(stream)

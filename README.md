@@ -24,6 +24,7 @@ Built with the [Meltano Singer SDK](https://sdk.meltano.com).
 | oauth_credentials   | False    | None    | Google Analytics OAuth Credentials |
 | reports             | False    | None    | A path to a file containing the Google Analytics reports definitions |
 | reports_list        | False    | None    | List of Google Analytics Reports Definitions |
+| merge_default_reports | False  | false   | When true and `reports_list` is set, sync the default reports (or the `reports` file) plus `reports_list`; a `reports_list` report with the same name as a default replaces it. When false, `reports_list` replaces the defaults. |
 | end_date            | False    | None    | The last record date to sync |
 | stream_maps         | False    | None    | Config object for stream maps capability. For more information check out [Stream Maps](https://sdk.meltano.com/en/latest/stream_maps.html). |
 | stream_map_config   | False    | None    | User-defined config values to be used within map expressions. |
@@ -144,7 +145,13 @@ When no report definitions are provided by the user, `tap-google-analytics` gene
 - **devices**: Most common metrics per day, device category, operating system and browser
 - **transactions**: Most common metrics per day, transactions, revenue per user, purchase revenue, and total revenue.
 
-This tap only allows incremental syncs using STATE records if the `date` dimension is included in the report. Otherwise it does not save state and does a full load each time. Without the `date` dimension this can be mitigated by allowing for chunked runs using [start_date, end_date).
+A report is synced incrementally using STATE records if it includes one of the time dimensions `date`, `dateHour`, `yearWeek`, `isoYearIsoWeek` or `yearMonth` (only one per report). That dimension is the replication key. On resume the tap requests from the start of the bookmarked period (the day for `dateHour`, the Sunday-start GA4 week for `yearWeek`, the Monday-start ISO week for `isoYearIsoWeek`, the first of the month for `yearMonth`) minus a 30-day lookback, moved back to a period boundary so the first week or month is never partial. The same boundary rule applies to `start_date` on the first sync.
+
+Reports whose time dimension is not `date` also get a `date` column: the first day of the period in GA4's `YYYYMMDD` format (for `dateHour`, that day). It is not part of the key; it lets loaders partition and replace by date.
+
+Reports without a time dimension do not save state and do a full load each time. This can be mitigated by allowing for chunked runs using [start_date, end_date).
+
+Reports can have at most 9 dimensions (including the time dimension) and 10 metrics.
 
 If not provided and the tap runs without a `--catalog` also provided, use [tap_google_analytics/defaults/default_report_definition.json](tap_google_analytics/defaults/default_report_definition.json) as the default definition.
 
@@ -158,7 +165,7 @@ The `reports.json` file structure expected by the `reports` config key is really
     [
       "Google Analytics Dimension",
       "Another Google Analytics Dimension",
-      ... up to 7 dimensions per stream ...
+      ... up to 9 dimensions per stream ...
     ],
     "metrics" :
     [
@@ -238,7 +245,7 @@ Segment IDs can be found with the [GA Query explorer](https://ga-dev-tools.appsp
 
 ## reports_list
 
-There may be situations where you won't want to save a file to your meltano directory. For example, if your meltano service is managing multiple user configurations. reports_list allows you to pass in a JSON configuration directly. You can directly pass in a list of reports in a format like below:
+There may be situations where you won't want to save a file to your meltano directory. For example, if your meltano service is managing multiple user configurations. reports_list allows you to pass in a JSON configuration directly. By default it replaces the default reports; set `merge_default_reports: true` to sync the defaults plus these reports (a report named like a default replaces that default). You can directly pass in a list of reports in a format like below:
 
 ```
 [
@@ -288,11 +295,13 @@ This tap makes some explicit decisions:
 
   This is important for defining the date range the records are for, especially when 'date' is not part of the requested Dimensions.
 
-- If 'date' has not been added as one of the Dimensions, then the {report_start_date, report_end_date} attributes are also added as keys.
+- If the report has no time dimension (date, dateHour, yearWeek, isoYearIsoWeek, yearMonth), then the {report_start_date, report_end_date} attributes are also added as keys.
 
   For example, if a user requests to see user stats by device or by source, the {start_date, end_date} can be used as part of the key uniquely identifying the generated stats.
 
   That way we can properly identify rows with no date dimension included and also update those rows over overlapping runs of the tap.
+
+- Metadata (valid dimensions and metrics) is fetched for every configured property. Custom fields (`customEvent:`, `customUser:`, `customItem:`, `keyEvents:<event>`, ...) differ per property, so a report field is valid if at least one property has it. Each property is requested without the fields it does not have; those columns are null in its records, and this is logged once per report and property. Properties whose metadata could not be fetched (quota) are requested with every field.
 
 - All streams and attributes are set to `"inclusion": "automatic"`
 

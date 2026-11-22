@@ -24,6 +24,11 @@ from tap_google_analytics.error import is_permission_denied_error
 from tap_google_analytics.error import is_quota_error
 from tap_google_analytics.property_ids import get_configured_property_ids
 from tap_google_analytics.quota_manager import QuotaManager
+from tap_google_analytics.time_dimensions import (
+    get_time_dimension,
+    period_start,
+    snap_to_period_start,
+)
 if t.TYPE_CHECKING:
     from singer_sdk.helpers.types import Context
 
@@ -43,7 +48,11 @@ class GoogleAnalyticsStream(Stream):
         self.report = kwargs.pop("ga_report")
         self.dimensions_ref = kwargs.pop("ga_dimensions_ref")
         self.metrics_ref = kwargs.pop("ga_metrics_ref")
+        # {property_id: (dimensions, metrics)}; missing properties get every field
+        self.property_metadata = kwargs.pop("ga_property_metadata", None) or {}
         self.analytics = kwargs.pop("ga_analytics_client")
+        self.time_dimension = get_time_dimension(self.report["dimensions"])
+        self._logged_dropped_fields: set[str] = set()
 
         super().__init__(*args, **kwargs)
 
@@ -166,25 +175,76 @@ class GoogleAnalyticsStream(Stream):
 
     def _get_state_filter(self, context: Context | None) -> str:
         state = self.get_context_state(context)
-        state_bookmark = state.get("replication_key_value") or self.config["start_date"]
-        
-        # Handle both YYYY-MM-DD and ISO format dates
-        try:
-            # Try parsing as ISO format first
-            parsed = datetime.fromisoformat(state_bookmark.replace('Z', '+00:00')).date()
-        except ValueError:
-            # If that fails, try parsing as YYYY-MM-DD
-            parsed = date.fromisoformat(state_bookmark)
-        
-        parsed = max(parsed, date(2019, 1, 1))
-        
-        # Only apply lookback window if we have a state bookmark
-        if state.get("replication_key_value"):
+        state_bookmark = state.get("replication_key_value")
+
+        if state_bookmark:
+            # The bookmark is a value of the report's time dimension
+            # (YYYYMMDD, YYYYMMDDHH, YYYYWW or YYYYMM): resume from its period start
+            parsed = period_start(self.time_dimension or "date", state_bookmark)
+            parsed = max(parsed, date(2019, 1, 1))
+            # Only apply lookback window if we have a state bookmark
             parsed = parsed - timedelta(days=30)
-        
+        else:
+            # Handles both YYYY-MM-DD and ISO format dates
+            parsed = period_start("date", self.config["start_date"])
+            parsed = max(parsed, date(2019, 1, 1))
+
+        # Start on a week / month boundary so the first period is complete
+        if self.time_dimension:
+            parsed = snap_to_period_start(self.time_dimension, parsed)
+
         # state bookmarks need to be reformatted for API requests
         return date.strftime(parsed, "%Y-%m-%d")
-        
+
+    def _report_for_property(self, property_id: str) -> dict | None:
+        """Return the report without the fields this property does not have.
+
+        Custom dimensions/metrics only exist on some properties. Fields are
+        dropped only when the property's metadata was fetched; they are emitted
+        as null. Returns None when no metric is left to request.
+        """
+        metadata = self.property_metadata.get(property_id)
+        if metadata is None:
+            return self.report
+
+        property_dimensions, property_metrics = metadata
+        dimensions = [
+            d
+            for d in self.report["dimensions"]
+            if d in property_dimensions or d not in self.dimensions_ref
+        ]
+        metrics = [
+            m
+            for m in self.report["metrics"]
+            if m in property_metrics or m not in self.metrics_ref
+        ]
+        dropped = [d for d in self.report["dimensions"] if d not in dimensions] + [
+            m for m in self.report["metrics"] if m not in metrics
+        ]
+        if not dropped:
+            return self.report
+
+        if property_id not in self._logged_dropped_fields:
+            self._logged_dropped_fields.add(property_id)
+            self.logger.warning(
+                "Report %s: property %s does not have %s; requesting without them "
+                "and emitting them as null.",
+                self.name,
+                property_id,
+                ", ".join(dropped),
+            )
+        if not metrics:
+            self.logger.warning(
+                "Report %s: property %s has none of the report's metrics; skipping it.",
+                self.name,
+                property_id,
+            )
+            return None
+
+        report = dict(self.report)
+        report["dimensions"] = dimensions
+        report["metrics"] = metrics
+        return report
 
     def _request_records(self, context: Context | None) -> t.Iterable[dict]:
         """Request records from multiple properties."""
@@ -207,11 +267,14 @@ class GoogleAnalyticsStream(Stream):
         property_ids = get_configured_property_ids(self.config)
 
         state_filter = self._get_state_filter(context)
-        api_report_def = self._generate_report_definition(self.report)
 
         # Fetch data for each property; skip properties we no longer have access to
         for property_id in property_ids:
             self.property_id = property_id  # Set current property_id for API calls
+            property_report = self._report_for_property(property_id)
+            if property_report is None:
+                continue
+            api_report_def = self._generate_report_definition(property_report)
             next_page_token: t.Any = None
             finished = False
 
@@ -307,6 +370,20 @@ class GoogleAnalyticsStream(Stream):
 
                 record[metric_name] = value
 
+            # Fields this property does not have were not requested
+            for field in (*self.report["dimensions"], *self.report["metrics"]):
+                record.setdefault(field, None)
+
+            # Weekly / monthly / hourly reports also get the period's first day
+            # as `date` so loaders can partition and replace by date
+            if self.time_dimension and self.time_dimension != "date":
+                try:
+                    record["date"] = period_start(
+                        self.time_dimension, record[self.time_dimension]
+                    ).strftime("%Y%m%d")
+                except (TypeError, ValueError):
+                    record["date"] = None
+
             # Add the property_id to each record. This is used to identify the property in the API response so that we can load multiple properties in the same sync eventually.
             record["property_id"] = f"properties/{self.property_id}"
 
@@ -380,18 +457,29 @@ class GoogleAnalyticsStream(Stream):
         primary_keys = []
         # : List[th.StringType] = []
 
-        # Track if there is a date set as one of the Dimensions
-        date_dimension_included = False
+        # The time dimension (date, dateHour, yearWeek, ...) is the replication key
+        if self.time_dimension:
+            self.replication_key = self.time_dimension
+
+        # Fields missing on some property are null in that property's records
+        partial_fields = set()
+        for property_dimensions, _property_metrics in self.property_metadata.values():
+            partial_fields.update(
+                d for d in self.report["dimensions"] if d not in property_dimensions
+            )
 
         # Add the dimensions to the schema and as key_properties
         for dimension in self.report["dimensions"]:
-            if dimension == "date":
-                date_dimension_included = True
-                self.replication_key = "date"
             data_type = self._lookup_data_type(
                 "dimension", dimension, self.dimensions_ref, self.metrics_ref
             )
-            properties.append(th.Property(dimension, self._get_datatype(data_type), required=True))
+            properties.append(
+                th.Property(
+                    dimension,
+                    self._get_datatype(data_type),
+                    required=dimension not in partial_fields,
+                )
+            )
             primary_keys.append(dimension)
 
         # Add the metrics to the schema
@@ -400,6 +488,10 @@ class GoogleAnalyticsStream(Stream):
                 "metric", metric, self.dimensions_ref, self.metrics_ref
             )
             properties.append(th.Property(metric, self._get_datatype(data_type)))
+
+        # First day of the period (YYYYMMDD) for non-daily time dimensions
+        if self.time_dimension and self.time_dimension != "date":
+            properties.append(th.Property("date", th.StringType()))
 
         # Add property_id to primary keys once
         primary_keys.append("property_id")
@@ -412,12 +504,11 @@ class GoogleAnalyticsStream(Stream):
                 th.Property("run_id", th.IntegerType(), required=True),
             )
         )
-        # If 'ga:date' has not been added as a Dimension, add the
-        #  {start_date, end_date} params as keys
-        if not date_dimension_included:
+        # Without a time dimension, add the {start_date, end_date} params as keys
+        if not self.time_dimension:
             self.logger.warning(
-                "Incremental sync not supported for stream %s, 'ga.date' is the only "
-                "supported replication key at this time.",
+                "Incremental sync not supported for stream %s: it has none of the time "
+                "dimensions date, dateHour, yearWeek, isoYearIsoWeek, yearMonth.",
                 self.tap_stream_id,
             )
             primary_keys.extend(("report_start_date", "report_end_date"))
