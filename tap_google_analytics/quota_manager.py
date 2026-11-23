@@ -8,7 +8,12 @@ import time
 from datetime import datetime, timedelta
 from typing import Callable, TypeVar
 
-from tap_google_analytics.error import classify_quota_error, is_quota_error
+from tap_google_analytics.error import (
+    classify_quota_error,
+    describe_error,
+    is_quota_error,
+    is_transient_error,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -19,6 +24,12 @@ _HOUR_RESET_BUFFER_SECONDS = 5.0
 # Cap exponential backoff for concurrent / rate-limit errors.
 _MAX_SHORT_BACKOFF_SECONDS = 60.0
 _MAX_SHORT_RETRIES = 8
+# Server errors and dropped connections (503 UNAVAILABLE, connection reset, 5xx, timeouts):
+# exponential backoff from 2s, capped at 120s, with jitter. 8 retries wait about 4-8 minutes
+# in all before the request is given up.
+_TRANSIENT_BASE_SECONDS = 2.0
+_MAX_TRANSIENT_BACKOFF_SECONDS = 120.0
+DEFAULT_TRANSIENT_RETRIES = 8
 
 
 class QuotaManager:
@@ -28,10 +39,15 @@ class QuotaManager:
         self,
         min_request_interval: float = 0.5,
         max_hourly_retries: int = 24,
+        max_transient_retries: int = DEFAULT_TRANSIENT_RETRIES,
     ) -> None:
         self.min_request_interval = max(float(min_request_interval), 0.0)
         self.max_hourly_retries = int(max_hourly_retries)
+        self.max_transient_retries = max(int(max_transient_retries), 0)
         self._last_request_at: float | None = None
+        # The last call's attempts (1 = no retry) and seconds, for the caller's failure report.
+        self.last_attempts = 0
+        self.last_seconds = 0.0
 
     @staticmethod
     def seconds_until_next_hour(now: datetime | None = None) -> float:
@@ -74,6 +90,32 @@ class QuotaManager:
             "GA4 API rate limited (attempt %s). Backing off for %.1fs.",
             attempt,
             delay,
+        )
+        time.sleep(delay)
+
+    @staticmethod
+    def transient_delay(attempt: int) -> float:
+        """Return the seconds to wait before transient retry ``attempt`` (1-based).
+
+        Exponential with jitter: half fixed, half random, so taps do not retry in step.
+        """
+        ceiling = min(_TRANSIENT_BASE_SECONDS * 2 ** (attempt - 1), _MAX_TRANSIENT_BACKOFF_SECONDS)
+        return ceiling / 2 + random.uniform(0, ceiling / 2)  # noqa: S311 - jitter, not crypto
+
+    def wait_transient(self, attempt: int, error: BaseException, label: str | None) -> None:
+        """Sleep before retrying a request Google failed or whose connection dropped."""
+        delay = self.transient_delay(attempt)
+        found = describe_error(error)
+        LOGGER.warning(
+            "GA4 request failed (%s%s%s)%s; retry %s of %s in %.1fs: %s",
+            found["cause"],
+            f", {found['status']}" if found["status"] else "",
+            f" {found['grpc_status']}" if found["grpc_status"] else "",
+            f" for {label}" if label else "",
+            attempt,
+            self.max_transient_retries,
+            delay,
+            error,
         )
         time.sleep(delay)
 
@@ -127,6 +169,7 @@ class QuotaManager:
         func: Callable[..., T],
         *args,
         max_hourly_retries: int | None = None,
+        label: str | None = None,
         **kwargs,
     ) -> T:
         """Invoke ``func`` with throttling and quota-aware retries.
@@ -134,18 +177,34 @@ class QuotaManager:
         Hourly token errors wait until the next clock hour.
         Concurrent / rate-limit errors use exponential backoff.
         Daily token errors are not retried (waiting will not recover them).
+        Server errors and dropped connections (5xx, gRPC UNAVAILABLE / DEADLINE_EXCEEDED /
+        INTERNAL, connection reset, timeouts) are retried with exponential backoff and jitter,
+        up to ``max_transient_retries`` times. ``label`` names the request in the logs.
+        ``last_attempts`` / ``last_seconds`` say how the call went, also when it raises.
         """
         hourly_retries = (
             self.max_hourly_retries if max_hourly_retries is None else int(max_hourly_retries)
         )
         hourly_attempts = 0
         short_attempts = 0
+        transient_attempts = 0
+        started = time.monotonic()
+        self.last_attempts = 0
+        self.last_seconds = 0.0
 
         while True:
             self.throttle()
+            self.last_attempts += 1
             try:
                 result = func(*args, **kwargs)
             except Exception as exc:
+                self.last_seconds = time.monotonic() - started
+                if is_transient_error(exc):
+                    transient_attempts += 1
+                    if transient_attempts > self.max_transient_retries:
+                        raise
+                    self.wait_transient(transient_attempts, exc, label)
+                    continue
                 if not is_quota_error(exc):
                     raise
 
@@ -168,5 +227,6 @@ class QuotaManager:
                 self.wait_exponential(short_attempts)
                 continue
 
+            self.last_seconds = time.monotonic() - started
             self.observe_response(result)
             return result
