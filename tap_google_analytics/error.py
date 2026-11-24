@@ -8,15 +8,27 @@ import logging
 import socket
 
 try:
+    from google.api_core.exceptions import GoogleAPICallError
     from google.api_core.exceptions import PermissionDenied as GooglePermissionDenied
     from google.api_core.exceptions import ResourceExhausted as GoogleResourceExhausted
 except ImportError:
     # Fallback so no exception is ever considered PermissionDenied / quota
-    class GooglePermissionDenied(Exception):
+    class GoogleAPICallError(Exception):  # type: ignore[no-redef]
+        """Stand-in when google-api-core is missing."""
+
+    class GooglePermissionDenied(Exception):  # type: ignore[no-redef]
         pass
 
-    class GoogleResourceExhausted(Exception):
+    class GoogleResourceExhausted(Exception):  # type: ignore[no-redef]
         pass
+
+
+try:
+    from google.auth.exceptions import TransportError as GoogleAuthTransportError
+except ImportError:
+
+    class GoogleAuthTransportError(Exception):  # type: ignore[no-redef]
+        """Stand-in when google-auth is missing."""
 
 
 class TapGaApiError(Exception):
@@ -171,7 +183,7 @@ def is_fatal_error(error):
     if isinstance(error, socket.timeout):
         return False
 
-    if is_quota_error(error):
+    if is_quota_error(error) or is_transient_error(error):
         return False
 
     # Google API exceptions have .message and .code; plain exceptions (e.g. RuntimeError)
@@ -189,3 +201,102 @@ def is_fatal_error(error):
 
     LOGGER.critical("Received fatal error %s, reason=%s, status=%s", error, reason, status)
     return True
+
+
+# HTTP statuses and gRPC status names Google says to retry with exponential backoff: the
+# server failed or the connection dropped, and the same request can succeed when sent again.
+TRANSIENT_HTTP_STATUSES = (500, 502, 503, 504)
+TRANSIENT_GRPC_STATUSES = ("UNAVAILABLE", "DEADLINE_EXCEEDED", "INTERNAL")
+HTTP_GATEWAY_TIMEOUT = 504
+HTTP_CLIENT_ERRORS = range(400, 500)
+
+
+def _chain(error: BaseException | None):
+    """The error and the errors it was raised from (``raise ... from``), outermost first."""
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        yield error
+        error = error.__cause__ or error.__context__
+
+
+def _http_status(error: BaseException):
+    code = getattr(error, "code", None)
+    return code if isinstance(code, int) else None
+
+
+def _grpc_status(error: BaseException) -> str | None:
+    status = getattr(error, "grpc_status_code", None)
+    if status is None and callable(getattr(error, "code", None)):
+        # A raw grpc.RpcError: code() is the StatusCode
+        try:
+            status = error.code()  # type: ignore[operator]
+        except Exception:  # noqa: BLE001
+            status = None
+    name = getattr(status, "name", None)
+    return name if isinstance(name, str) else None
+
+
+def is_transient_error(error: BaseException) -> bool:
+    """Return True when sending the same request again can succeed.
+
+    That is a 5xx from Google, a gRPC UNAVAILABLE / DEADLINE_EXCEEDED / INTERNAL, or a
+    dropped or timed-out connection. Looks through ``raise ... from``, so a wrapped error is
+    judged by what Google returned.
+    Quota and rate-limit errors are not transient here: QuotaManager waits for those.
+    """
+    for err in _chain(error):
+        if is_quota_error(err):
+            return False
+        if isinstance(
+            err, (ConnectionError, TimeoutError, socket.timeout, GoogleAuthTransportError)
+        ):
+            return True
+        if isinstance(err, GoogleAPICallError) and _http_status(err) in TRANSIENT_HTTP_STATUSES:
+            return True
+        if _grpc_status(err) in TRANSIENT_GRPC_STATUSES:
+            return True
+    return False
+
+
+def describe_error(error: BaseException) -> dict:
+    """Return what Google returned, as plain values.
+
+    The HTTP status, gRPC status name, the error reason (ErrorInfo / API reason) and a short
+    cause code, read through ``raise ... from``.
+    """
+    status = grpc_status = reason = None
+    for err in _chain(error):
+        if status is None:
+            status = _http_status(err) if isinstance(err, GoogleAPICallError) else None
+        grpc_status = grpc_status or _grpc_status(err)
+        reason = reason or getattr(err, "reason", None) or error_reason(err) or None
+    message = str(error).lower()
+    if any(is_quota_error(err) for err in _chain(error)):
+        cause = "quota"
+    elif any(isinstance(err, GooglePermissionDenied) for err in _chain(error)):
+        cause = "permission_denied"
+    elif "connection reset" in message or any(
+        isinstance(err, ConnectionResetError) for err in _chain(error)
+    ):
+        cause = "connection_reset"
+    elif (
+        grpc_status == "DEADLINE_EXCEEDED"
+        or status == HTTP_GATEWAY_TIMEOUT
+        or "timed out" in message
+        or any(isinstance(err, (TimeoutError, socket.timeout)) for err in _chain(error))
+    ):
+        cause = "timeout"
+    elif is_transient_error(error):
+        cause = "server_error"
+    else:
+        cause = "request_rejected" if status in HTTP_CLIENT_ERRORS else "other"
+    return {
+        "status": status,
+        "grpc_status": grpc_status,
+        "reason": reason if isinstance(reason, str) else None,
+        "cause": cause,
+        "error": type(
+            next((e for e in _chain(error) if isinstance(e, GoogleAPICallError)), error)
+        ).__name__,
+    }

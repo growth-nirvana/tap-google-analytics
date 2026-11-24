@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import copy
 import functools
+import json
 import sys
 import typing as t
 from datetime import date, datetime, timedelta, timezone
 import uuid
 
-import backoff
 from google.analytics.data_v1beta.types import (
     DateRange,
     Metric,
@@ -19,11 +19,11 @@ from google.analytics.data_v1beta.types import (
 from singer_sdk import typing as th
 from singer_sdk.streams import Stream
 
-from tap_google_analytics.error import is_fatal_error
+from tap_google_analytics.error import describe_error
 from tap_google_analytics.error import is_permission_denied_error
 from tap_google_analytics.error import is_quota_error
 from tap_google_analytics.property_ids import get_configured_property_ids
-from tap_google_analytics.quota_manager import QuotaManager
+from tap_google_analytics.quota_manager import DEFAULT_TRANSIENT_RETRIES, QuotaManager
 from tap_google_analytics.time_dimensions import (
     get_time_dimension,
     period_start,
@@ -63,6 +63,9 @@ class GoogleAnalyticsStream(Stream):
         self.quota_manager = getattr(tap, "quota_manager", None) or QuotaManager(
             min_request_interval=float(self.config.get("request_delay_seconds", 0.5)),
             max_hourly_retries=int(self.config.get("quota_max_hourly_retries", 24)),
+            max_transient_retries=int(
+                self.config.get("max_transient_retries", DEFAULT_TRANSIENT_RETRIES)
+            ),
         )
 
         # Generate a unique run_id for this tap run if not already set
@@ -396,9 +399,15 @@ class GoogleAnalyticsStream(Stream):
 
             yield record
 
-    @backoff.on_exception(backoff.expo, (Exception), max_tries=5, giveup=is_fatal_error)
     def _query_api(self, report_definition, state_filter, pageToken=None) -> RunReportResponse:
-        """Query the Analytics Reporting API V4."""
+        """Run one page of the report for the current property.
+
+        QuotaManager retries quota waits, rate limits, server errors and dropped connections.
+        When it gives up, a ``REQUEST FAILED {json}`` line says which request failed and what
+        Google returned (property, stream, date range, offset, HTTP / gRPC status, reason,
+        attempts), and the error raised names the property.
+        """
+        offset = (pageToken or 0) * self.page_size
         request = RunReportRequest(
             property=f"properties/{self.property_id}",
             dimensions=report_definition["dimensions"],
@@ -407,21 +416,40 @@ class GoogleAnalyticsStream(Stream):
             limit=self.page_size,
             metric_filter=report_definition["metricFilter"],
             dimension_filter=report_definition["dimensionFilter"],
-            offset=(pageToken or 0) * self.page_size,
+            offset=offset,
             return_property_quota=True,
+        )
+        label = (
+            f"property {self.property_id}, stream {self.name}, "
+            f"{state_filter}..{self.end_date}, offset {offset}"
         )
 
         try:
-            return self.quota_manager.call(self.analytics.run_report, request)
+            return self.quota_manager.call(self.analytics.run_report, request, label=label)
         except Exception as e:
+            if is_permission_denied_error(e):
+                # _request_records skips the property; not a failure
+                raise RuntimeError(f"Property ID '{self.property_id}': {e}") from e  # noqa: TRY003
+            detail = {
+                "tap": "tap-google-analytics",
+                "stream": self.name,
+                "account_id": str(self.property_id),
+                "start_date": state_filter,
+                "end_date": self.end_date,
+                "offset": offset,
+                "limit": self.page_size,
+                "attempts": self.quota_manager.last_attempts,
+                "seconds": round(self.quota_manager.last_seconds, 1),
+                **describe_error(e),
+            }
+            # One line with no traceback: the caller (e.g. Aria's singer-connector) reads it.
+            self.logger.error("REQUEST FAILED %s", json.dumps(detail, sort_keys=True))  # noqa: TRY400
             if is_quota_error(e):
                 raise RuntimeError(
                     f"Exceeded maximum retries waiting for GA4 quota reset on property "
                     f"'{self.property_id}'. Last error: {e}"
                 ) from e
-            raise RuntimeError(
-                f"Property ID '{self.property_id}': {e}"
-            ) from e
+            raise RuntimeError(f"Property ID '{self.property_id}': {e}") from e
 
     @staticmethod
     def _get_datatype(string_type):

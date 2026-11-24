@@ -154,6 +154,16 @@ class TapGoogleAnalytics(Tap):
             default=24,
         ),
         th.Property(
+            "max_transient_retries",
+            th.IntegerType,
+            description=(
+                "How many times to retry a request Google failed or whose connection "
+                "dropped (5xx, gRPC UNAVAILABLE / DEADLINE_EXCEEDED / INTERNAL, connection "
+                "reset, timeout), with exponential backoff and jitter from 2s up to 120s."
+            ),
+            default=8,
+        ),
+        th.Property(
             "quota_metadata_max_hourly_retries",
             th.IntegerType,
             description=(
@@ -474,6 +484,7 @@ class TapGoogleAnalytics(Tap):
         self.quota_manager = QuotaManager(
             min_request_interval=float(self.config.get("request_delay_seconds", 0.5)),
             max_hourly_retries=int(self.config.get("quota_max_hourly_retries", 24)),
+            max_transient_retries=int(self.config.get("max_transient_retries", 8)),
         )
         # Load reports first so metadata fetch can fall back to inferred types.
         self.reports_definition = self._get_reports_config()
