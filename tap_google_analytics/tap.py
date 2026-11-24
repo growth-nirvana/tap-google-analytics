@@ -175,6 +175,19 @@ class TapGoogleAnalytics(Tap):
             default=8,
         ),
         th.Property(
+            "quota_hourly_action",
+            th.StringType,
+            allowed_values=["wait", "exit"],
+            description=(
+                "What to do when the GA4 hourly token quota is exhausted during sync: "
+                "'wait' sleeps until the next clock hour and retries (up to "
+                "quota_max_hourly_retries); 'exit' logs one 'QUOTA EXHAUSTED {json}' line "
+                "(property_id, stream, retry_at in UTC) and stops the tap with an error, so "
+                "the caller can retry after retry_at instead of sleeping."
+            ),
+            default="wait",
+        ),
+        th.Property(
             "quota_metadata_max_hourly_retries",
             th.IntegerType,
             description=(
@@ -495,6 +508,7 @@ class TapGoogleAnalytics(Tap):
         self.quota_manager = QuotaManager(
             min_request_interval=float(self.config.get("request_delay_seconds", 0.5)),
             max_hourly_retries=int(self.config.get("quota_max_hourly_retries", 24)),
+            hourly_action=str(self.config.get("quota_hourly_action") or "wait"),
             max_transient_retries=int(self.config.get("max_transient_retries", 8)),
         )
         # Load reports first so metadata fetch can fall back to inferred types.

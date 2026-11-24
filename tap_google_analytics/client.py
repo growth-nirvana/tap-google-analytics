@@ -19,6 +19,7 @@ from google.analytics.data_v1beta.types import (
 from singer_sdk import typing as th
 from singer_sdk.streams import Stream
 
+from tap_google_analytics.error import TapGaQuotaExhaustedError
 from tap_google_analytics.error import describe_error
 from tap_google_analytics.error import is_permission_denied_error
 from tap_google_analytics.error import is_quota_error
@@ -70,6 +71,7 @@ class GoogleAnalyticsStream(Stream):
         self.quota_manager = getattr(tap, "quota_manager", None) or QuotaManager(
             min_request_interval=float(self.config.get("request_delay_seconds", 0.5)),
             max_hourly_retries=int(self.config.get("quota_max_hourly_retries", 24)),
+            hourly_action=str(self.config.get("quota_hourly_action") or "wait"),
             max_transient_retries=int(
                 self.config.get("max_transient_retries", DEFAULT_TRANSIENT_RETRIES)
             ),
@@ -495,7 +497,15 @@ class GoogleAnalyticsStream(Stream):
         )
 
         try:
-            return self.quota_manager.call(self.analytics.run_report, request, label=label)
+            return self.quota_manager.call(
+                self.analytics.run_report,
+                request,
+                label=label,
+                quota_context={"property_id": self.property_id, "stream": self.name},
+            )
+        except TapGaQuotaExhaustedError:
+            # quota_hourly_action "exit": its QUOTA EXHAUSTED line is logged; the tap stops.
+            raise
         except Exception as e:
             if is_permission_denied_error(e):
                 # _request_records skips the property; not a failure

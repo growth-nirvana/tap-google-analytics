@@ -27,6 +27,7 @@ Built with the [Meltano Singer SDK](https://sdk.meltano.com).
 | merge_default_reports | False  | false   | When true and `reports_list` is set, sync the default reports (or the `reports` file) plus `reports_list`; a `reports_list` report with the same name as a default replaces it. When false, `reports_list` replaces the defaults. |
 | end_date            | False    | None    | The last record date to sync |
 | date_windows        | False    | true    | Request each property's report one date window at a time (calendar months; 5 whole weeks for weekly reports; one range for reports without a time dimension) and write a STATE message after each window, so a run that stops resumes each property after its last finished window. |
+| quota_hourly_action | False    | wait    | When the GA4 hourly token quota is exhausted: `wait` sleeps until the next clock hour and retries (up to `quota_max_hourly_retries`); `exit` logs one `QUOTA EXHAUSTED {json}` line (`tap`, `kind`, `property_id`, `stream`, `retry_at` in UTC, `message`) and stops the tap with an error, so the caller can retry after `retry_at` instead of sleeping. |
 | stream_maps         | False    | None    | Config object for stream maps capability. For more information check out [Stream Maps](https://sdk.meltano.com/en/latest/stream_maps.html). |
 | stream_map_config   | False    | None    | User-defined config values to be used within map expressions. |
 | flattening_enabled  | False    | None    | 'True' to enable schema flattening and automatically expand nested properties. |

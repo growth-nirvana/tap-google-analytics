@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import random
 import time
-from datetime import datetime, timedelta
-from typing import Callable, TypeVar
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable, TypeVar
 
 from tap_google_analytics.error import (
+    TapGaQuotaExhaustedError,
     classify_quota_error,
     describe_error,
     is_quota_error,
@@ -30,6 +32,10 @@ _MAX_SHORT_RETRIES = 8
 _TRANSIENT_BASE_SECONDS = 2.0
 _MAX_TRANSIENT_BACKOFF_SECONDS = 120.0
 DEFAULT_TRANSIENT_RETRIES = 8
+# quota_hourly_action: "wait" sleeps until the next hour and retries; "exit" stops the tap
+# with one QUOTA EXHAUSTED line saying when to try again.
+HOURLY_ACTIONS = ("wait", "exit")
+QUOTA_EXHAUSTED_MARKER = "QUOTA EXHAUSTED"
 
 
 class QuotaManager:
@@ -40,9 +46,17 @@ class QuotaManager:
         min_request_interval: float = 0.5,
         max_hourly_retries: int = 24,
         max_transient_retries: int = DEFAULT_TRANSIENT_RETRIES,
+        hourly_action: str = "wait",
     ) -> None:
         self.min_request_interval = max(float(min_request_interval), 0.0)
         self.max_hourly_retries = int(max_hourly_retries)
+        action = (hourly_action or "wait").lower()
+        if action not in HOURLY_ACTIONS:
+            allowed = ", ".join(HOURLY_ACTIONS)
+            raise ValueError(  # noqa: TRY003
+                f"quota_hourly_action must be one of {allowed}, not {hourly_action!r}"
+            )
+        self.hourly_action = action
         self.max_transient_retries = max(int(max_transient_retries), 0)
         self._last_request_at: float | None = None
         # The last call's attempts (1 = no retry) and seconds, for the caller's failure report.
@@ -56,6 +70,42 @@ class QuotaManager:
         next_hour = current.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
         wait_seconds = (next_hour - current).total_seconds() + _HOUR_RESET_BUFFER_SECONDS
         return max(wait_seconds, 1.0)
+
+    @staticmethod
+    def next_hour_utc(now: datetime | None = None) -> datetime:
+        """The next clock hour in UTC plus the reset buffer: when hourly tokens are back."""
+        current = now or datetime.now(timezone.utc)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        current = current.astimezone(timezone.utc)
+        next_hour = current.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        return next_hour + timedelta(seconds=_HOUR_RESET_BUFFER_SECONDS)
+
+    def exhausted(
+        self, exc: BaseException, context: dict[str, Any] | None = None
+    ) -> TapGaQuotaExhaustedError:
+        """Log the QUOTA EXHAUSTED line for an hourly-token error; return the error to raise."""
+        context = context or {}
+        retry_at = self.next_hour_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
+        property_id = context.get("property_id")
+        stream = context.get("stream")
+        message = str(exc)[:300]
+        payload = {
+            "tap": "tap-google-analytics",
+            "kind": "hourly_tokens",
+            "property_id": None if property_id is None else str(property_id),
+            "stream": stream,
+            "retry_at": retry_at,
+            "message": message,
+        }
+        LOGGER.error("%s %s", QUOTA_EXHAUSTED_MARKER, json.dumps(payload, sort_keys=True))
+        return TapGaQuotaExhaustedError(
+            f"GA4 hourly token quota exhausted for property '{property_id}'; "
+            f"retry after {retry_at}: {message}",
+            property_id=property_id,
+            stream=stream,
+            retry_at=retry_at,
+        )
 
     def throttle(self) -> None:
         """Sleep so consecutive API calls respect ``min_request_interval``."""
@@ -164,17 +214,20 @@ class QuotaManager:
             )
             time.sleep(extra)
 
-    def call(
+    def call(  # noqa: C901
         self,
         func: Callable[..., T],
         *args,
         max_hourly_retries: int | None = None,
         label: str | None = None,
+        quota_context: dict[str, Any] | None = None,
         **kwargs,
     ) -> T:
         """Invoke ``func`` with throttling and quota-aware retries.
 
-        Hourly token errors wait until the next clock hour.
+        Hourly token errors wait until the next clock hour; with hourly_action "exit" they
+        raise TapGaQuotaExhaustedError instead, after one QUOTA EXHAUSTED line naming
+        ``quota_context``'s property_id and stream.
         Concurrent / rate-limit errors use exponential backoff.
         Daily token errors are not retried (waiting will not recover them).
         Server errors and dropped connections (5xx, gRPC UNAVAILABLE / DEADLINE_EXCEEDED /
@@ -218,6 +271,8 @@ class QuotaManager:
                     hourly_attempts += 1
                     if hourly_attempts > hourly_retries:
                         raise
+                    if self.hourly_action == "exit":
+                        raise self.exhausted(exc, quota_context) from exc
                     self.wait_for_quota_reset()
                     continue
 
