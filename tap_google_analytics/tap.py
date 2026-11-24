@@ -136,6 +136,17 @@ class TapGoogleAnalytics(Tap):
             default=_end_date.isoformat(),
         ),
         th.Property(
+            "date_windows",
+            th.BooleanType,
+            description=(
+                "Request each property's report one date window at a time (calendar months; "
+                "5 whole weeks for weekly reports; reports without a time dimension stay one "
+                "range), writing a STATE message after each window. A run that stops resumes "
+                "each property after its last finished window instead of from the start."
+            ),
+            default=True,
+        ),
+        th.Property(
             "request_delay_seconds",
             th.NumberType,
             description=(

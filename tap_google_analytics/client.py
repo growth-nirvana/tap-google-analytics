@@ -25,6 +25,7 @@ from tap_google_analytics.error import is_quota_error
 from tap_google_analytics.property_ids import get_configured_property_ids
 from tap_google_analytics.quota_manager import DEFAULT_TRANSIENT_RETRIES, QuotaManager
 from tap_google_analytics.time_dimensions import (
+    date_windows,
     get_time_dimension,
     period_start,
     snap_to_period_start,
@@ -36,6 +37,12 @@ if sys.version_info < (3, 11):
     from backports.datetime_fromisoformat import MonkeyPatch
 
     MonkeyPatch.patch_fromisoformat()
+
+
+# Stream state key: {property_id: last day of the last date window finished} for a sync that
+# has not finished yet. A run that stops resumes each property the day after it; a stream that
+# finishes removes it.
+PROGRESS_KEY = "property_progress"
 
 
 class GoogleAnalyticsStream(Stream):
@@ -172,9 +179,13 @@ class GoogleAnalyticsStream(Stream):
         return report_definition
 
     def _request_data(
-        self, api_report_def, state_filter: str, next_page_token: t.Any | None
+        self,
+        api_report_def,
+        state_filter: str,
+        next_page_token: t.Any | None,
+        end_date: str | None = None,
     ) -> RunReportResponse:
-        return self._query_api(api_report_def, state_filter, next_page_token)
+        return self._query_api(api_report_def, state_filter, next_page_token, end_date=end_date)
 
     def _get_state_filter(self, context: Context | None) -> str:
         state = self.get_context_state(context)
@@ -270,6 +281,9 @@ class GoogleAnalyticsStream(Stream):
         property_ids = get_configured_property_ids(self.config)
 
         state_filter = self._get_state_filter(context)
+        state = self.get_context_state(context)
+        progress: dict[str, str] = dict(state.get(PROGRESS_KEY) or {})
+        end = date.fromisoformat(self.end_date)
 
         # Fetch data for each property; skip properties we no longer have access to
         for property_id in property_ids:
@@ -278,30 +292,17 @@ class GoogleAnalyticsStream(Stream):
             if property_report is None:
                 continue
             api_report_def = self._generate_report_definition(property_report)
-            next_page_token: t.Any = None
-            finished = False
+            start = self._property_start(property_id, state_filter, progress)
 
             try:
-                while not finished:
-                    resp = self._request_data(
-                        api_report_def,
-                        state_filter=state_filter,
-                        next_page_token=next_page_token,
+                for window_start, window_end in self._windows(start, end):
+                    yield from self._request_window(
+                        api_report_def, window_start.isoformat(), window_end.isoformat()
                     )
-
-                    yield from self._parse_response(resp)
-
-                    previous_token = copy.deepcopy(next_page_token)
-                    next_page_token = self._get_next_page_token(
-                        response=resp, previous_token=previous_token
-                    )
-                    if next_page_token and next_page_token == previous_token:
-                        msg = (
-                            f"Loop detected in pagination. "
-                            f"Pagination token {next_page_token} is identical to prior token."
-                        )
-                        raise RuntimeError(msg)
-                    finished = not next_page_token
+                    # Every row of the window is out: say so, so a run that stops later
+                    # resumes this property after it.
+                    progress[property_id] = window_end.isoformat()
+                    self._checkpoint(state, progress)
             except Exception as e:
                 if is_permission_denied_error(e):
                     self.logger.warning(
@@ -311,6 +312,72 @@ class GoogleAnalyticsStream(Stream):
                     )
                     continue
                 raise
+
+        # The stream finished: its bookmark (the SDK's) covers every property again.
+        state.pop(PROGRESS_KEY, None)
+
+    def _windows(self, start: date, end: date) -> list[tuple[date, date]]:
+        """The date windows to request, each checkpointed when done (config date_windows)."""
+        if not self.config.get("date_windows", True):
+            return [(start, end)] if start <= end else []
+        return date_windows(self.time_dimension, start, end)
+
+    def _property_start(self, property_id: str, state_filter: str, progress: dict) -> date:
+        """Where this property starts: the stream's start, or, when a run that stopped had
+        finished windows of it, the period after the last one."""
+        start = date.fromisoformat(state_filter)
+        done = progress.get(property_id)
+        if not done:
+            return start
+        if not self.time_dimension:
+            # Its rows add up the whole range: finished for this range, or pulled again whole.
+            return date.fromisoformat(self.end_date) + timedelta(days=1) if done >= self.end_date else start
+        resume = date.fromisoformat(done) + timedelta(days=1)
+        if self.time_dimension:
+            resume = snap_to_period_start(self.time_dimension, resume)
+        if resume > start:
+            self.logger.info(
+                "Report %s: property %s resumes at %s (pulled through %s before)",
+                self.name,
+                property_id,
+                resume.isoformat(),
+                done,
+            )
+            return resume
+        return start
+
+    def _checkpoint(self, state: dict, progress: dict[str, str]) -> None:
+        """Write a STATE now: every record sent so far is vouched for (Singer targets load up to
+        the last STATE; Aria's singer-connector loads up to it when a run stops early)."""
+        state[PROGRESS_KEY] = dict(progress)
+        self._is_state_flushed = False
+        self._write_state_message()
+
+    def _request_window(self, api_report_def, start: str, end: str) -> t.Iterable[dict]:
+        """Every row of one property's report for start..end, page by page."""
+        next_page_token: t.Any = None
+        finished = False
+        while not finished:
+            resp = self._request_data(
+                api_report_def,
+                state_filter=start,
+                next_page_token=next_page_token,
+                end_date=end,
+            )
+
+            yield from self._parse_response(resp)
+
+            previous_token = copy.deepcopy(next_page_token)
+            next_page_token = self._get_next_page_token(
+                response=resp, previous_token=previous_token
+            )
+            if next_page_token and next_page_token == previous_token:
+                msg = (
+                    f"Loop detected in pagination. "
+                    f"Pagination token {next_page_token} is identical to prior token."
+                )
+                raise RuntimeError(msg)
+            finished = not next_page_token
 
     def _get_next_page_token(self, response: RunReportResponse, previous_token) -> t.Any:
         """Get the next page token from a response.
@@ -399,7 +466,9 @@ class GoogleAnalyticsStream(Stream):
 
             yield record
 
-    def _query_api(self, report_definition, state_filter, pageToken=None) -> RunReportResponse:
+    def _query_api(
+        self, report_definition, state_filter, pageToken=None, end_date=None
+    ) -> RunReportResponse:
         """Run one page of the report for the current property.
 
         QuotaManager retries quota waits, rate limits, server errors and dropped connections.
@@ -408,11 +477,12 @@ class GoogleAnalyticsStream(Stream):
         attempts), and the error raised names the property.
         """
         offset = (pageToken or 0) * self.page_size
+        end_date = end_date or self.end_date
         request = RunReportRequest(
             property=f"properties/{self.property_id}",
             dimensions=report_definition["dimensions"],
             metrics=report_definition["metrics"],
-            date_ranges=[DateRange(start_date=state_filter, end_date=self.end_date)],
+            date_ranges=[DateRange(start_date=state_filter, end_date=end_date)],
             limit=self.page_size,
             metric_filter=report_definition["metricFilter"],
             dimension_filter=report_definition["dimensionFilter"],
@@ -421,7 +491,7 @@ class GoogleAnalyticsStream(Stream):
         )
         label = (
             f"property {self.property_id}, stream {self.name}, "
-            f"{state_filter}..{self.end_date}, offset {offset}"
+            f"{state_filter}..{end_date}, offset {offset}"
         )
 
         try:
@@ -435,7 +505,7 @@ class GoogleAnalyticsStream(Stream):
                 "stream": self.name,
                 "account_id": str(self.property_id),
                 "start_date": state_filter,
-                "end_date": self.end_date,
+                "end_date": end_date,
                 "offset": offset,
                 "limit": self.page_size,
                 "attempts": self.quota_manager.last_attempts,
