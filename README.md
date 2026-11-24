@@ -26,6 +26,7 @@ Built with the [Meltano Singer SDK](https://sdk.meltano.com).
 | reports_list        | False    | None    | List of Google Analytics Reports Definitions |
 | merge_default_reports | False  | false   | When true and `reports_list` is set, sync the default reports (or the `reports` file) plus `reports_list`; a `reports_list` report with the same name as a default replaces it. When false, `reports_list` replaces the defaults. |
 | end_date            | False    | None    | The last record date to sync |
+| date_windows        | False    | true    | Request each property's report one date window at a time (calendar months; 5 whole weeks for weekly reports; one range for reports without a time dimension) and write a STATE message after each window, so a run that stops resumes each property after its last finished window. |
 | stream_maps         | False    | None    | Config object for stream maps capability. For more information check out [Stream Maps](https://sdk.meltano.com/en/latest/stream_maps.html). |
 | stream_map_config   | False    | None    | User-defined config values to be used within map expressions. |
 | flattening_enabled  | False    | None    | 'True' to enable schema flattening and automatically expand nested properties. |
@@ -302,6 +303,8 @@ This tap makes some explicit decisions:
   That way we can properly identify rows with no date dimension included and also update those rows over overlapping runs of the tap.
 
 - Metadata (valid dimensions and metrics) is fetched for every configured property. Custom fields (`customEvent:`, `customUser:`, `customItem:`, `keyEvents:<event>`, ...) differ per property, so a report field is valid if at least one property has it. Each property is requested without the fields it does not have; those columns are null in its records, and this is logged once per report and property. Properties whose metadata could not be fetched (quota) are requested with every field.
+
+- Each property's report is requested one date window at a time (`date_windows`, on by default): calendar months for `date`, `dateHour` and `yearMonth` reports, 5 whole weeks for `yearWeek` / `isoYearIsoWeek` (no week is split), and one range for a report without a time dimension (its rows add up the range). Page size is unchanged (100,000 rows per request). After each window the tap writes a STATE message whose stream bookmark holds `property_progress` (`{property_id: last day of the last finished window}`), so every record before it is complete for its window. A run that stops (a request that fails for good, a time limit) is resumed by the next run from that state: each property starts the period after its last finished window, the others where they would anyway. When the stream finishes, `property_progress` is dropped and the SDK's own bookmark (`replication_key_value`, with its 30-day lookback) stands alone.
 
 - All streams and attributes are set to `"inclusion": "automatic"`
 

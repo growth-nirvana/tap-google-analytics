@@ -67,3 +67,43 @@ def snap_to_period_start(time_dimension: str, day: date) -> date:
     if time_dimension == "yearMonth":
         return day.replace(day=1)
     return day
+
+
+# Weeks per date window for weekly reports (whole weeks, so no week is split in two).
+WEEKS_PER_WINDOW = 5
+
+
+def next_period_start(time_dimension: str | None, day: date) -> date:
+    """The first day of the period after the one that contains ``day``."""
+    if time_dimension == "yearMonth":
+        return date(day.year + (day.month == 12), day.month % 12 + 1, 1)  # noqa: PLR2004
+    if time_dimension == "isoYearIsoWeek":
+        return day - timedelta(days=day.weekday()) + timedelta(weeks=1)
+    if time_dimension == "yearWeek":
+        # GA4 weeks start on Sunday, and January 1st always starts week 01.
+        next_sunday = day + timedelta(days=6 - (day.weekday() + 1) % 7 + 1)
+        new_year = date(day.year + 1, 1, 1)
+        return min(next_sunday, new_year)
+    return day + timedelta(days=1)
+
+
+def date_windows(time_dimension: str | None, start: date, end: date) -> list[tuple[date, date]]:
+    """``start``..``end`` (inclusive) in windows of whole periods: calendar months for daily,
+    hourly and monthly reports, WEEKS_PER_WINDOW whole weeks for weekly ones. A report without a
+    time dimension is one window: its rows add up the whole range, so splitting it would change
+    them. ``start`` is a period start (snap_to_period_start)."""
+    if start > end:
+        return []
+    if time_dimension is None:
+        return [(start, end)]
+    windows = []
+    while start <= end:
+        if time_dimension in ("yearWeek", "isoYearIsoWeek"):
+            following = start
+            for _ in range(WEEKS_PER_WINDOW):
+                following = next_period_start(time_dimension, following)
+        else:
+            following = next_period_start("yearMonth", start)
+        windows.append((start, min(end, following - timedelta(days=1))))
+        start = following
+    return windows
