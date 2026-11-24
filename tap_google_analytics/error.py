@@ -51,6 +51,21 @@ class TapGaQuotaExceededError(TapGaApiError):
     """Exception for Quota Exceeded errors."""
 
 
+class TapGaQuotaExhaustedError(TapGaApiError):
+    """The hourly GA4 token quota ran out and quota_hourly_action is "exit".
+
+    Raised instead of sleeping until the next hour, after one ``QUOTA EXHAUSTED {json}`` line,
+    so the tap stops and the caller can retry after ``retry_at``.
+    """
+
+    def __init__(self, message: str, *, property_id=None, stream=None, retry_at: str = "") -> None:
+        """Keep the property, stream and retry time (UTC, ISO 8601) the error is about."""
+        super().__init__(message)
+        self.property_id = property_id
+        self.stream = stream
+        self.retry_at = retry_at
+
+
 class TapGaBackendServerError(TapGaApiError):
     """Exception for 500 and 503 backend errors that are Google's fault."""
 
@@ -180,6 +195,10 @@ def classify_quota_error(error) -> str:
 
 def is_fatal_error(error):
     """Return a boolean value depending on if its a fatal error or not."""
+    if isinstance(error, TapGaQuotaExhaustedError):
+        # Hourly quota with quota_hourly_action "exit": stop now, never retry.
+        return True
+
     if isinstance(error, socket.timeout):
         return False
 
