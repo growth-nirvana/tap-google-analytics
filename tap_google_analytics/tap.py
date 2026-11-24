@@ -136,6 +136,15 @@ class TapGoogleAnalytics(Tap):
             default=_end_date.isoformat(),
         ),
         th.Property(
+            "backfill_properties",
+            th.ArrayType(th.StringType),
+            description=(
+                "Property IDs to pull from start_date on this run, whatever their bookmark "
+                "(e.g. a property added to an existing connection before per-property bookmarks). "
+                "Other properties keep their own bookmarks."
+            ),
+        ),
+        th.Property(
             "date_windows",
             th.BooleanType,
             description=(

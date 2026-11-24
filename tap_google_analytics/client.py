@@ -44,6 +44,11 @@ if sys.version_info < (3, 11):
 # has not finished yet. A run that stops resumes each property the day after it; a stream that
 # finishes removes it.
 PROGRESS_KEY = "property_progress"
+# Stream state key: {property_id: last day pulled}, kept across runs. Each property resumes from
+# its own bookmark (less the lookback), so a property added to a connection starts at start_date
+# instead of the stream's bookmark (Aria gn-947291-ga4-8a53c1: a property swapped in got 30 days).
+BOOKMARKS_KEY = "property_bookmarks"
+LOOKBACK = timedelta(days=30)
 
 
 class GoogleAnalyticsStream(Stream):
@@ -189,7 +194,19 @@ class GoogleAnalyticsStream(Stream):
     ) -> RunReportResponse:
         return self._query_api(api_report_def, state_filter, next_page_token, end_date=end_date)
 
+    def _start_date(self) -> date:
+        # Handles both YYYY-MM-DD and ISO format dates
+        return max(period_start("date", self.config["start_date"]), date(2019, 1, 1))
+
+    def _snap(self, day: date) -> str:
+        # Start on a week / month boundary so the first period is complete
+        if self.time_dimension:
+            day = snap_to_period_start(self.time_dimension, day)
+        # state bookmarks need to be reformatted for API requests
+        return date.strftime(day, "%Y-%m-%d")
+
     def _get_state_filter(self, context: Context | None) -> str:
+        """Return the stream's start from its SDK bookmark (state before per-property ones)."""
         state = self.get_context_state(context)
         state_bookmark = state.get("replication_key_value")
 
@@ -199,18 +216,62 @@ class GoogleAnalyticsStream(Stream):
             parsed = period_start(self.time_dimension or "date", state_bookmark)
             parsed = max(parsed, date(2019, 1, 1))
             # Only apply lookback window if we have a state bookmark
-            parsed = parsed - timedelta(days=30)
+            parsed = parsed - LOOKBACK
         else:
-            # Handles both YYYY-MM-DD and ISO format dates
-            parsed = period_start("date", self.config["start_date"])
-            parsed = max(parsed, date(2019, 1, 1))
+            parsed = self._start_date()
+        return self._snap(parsed)
 
-        # Start on a week / month boundary so the first period is complete
-        if self.time_dimension:
-            parsed = snap_to_period_start(self.time_dimension, parsed)
+    def _property_bookmarks(self, state: dict, property_ids: list[str]) -> dict[str, str]:
+        """Return {property_id: last day pulled}.
 
-        # state bookmarks need to be reformatted for API requests
-        return date.strftime(parsed, "%Y-%m-%d")
+        State written before per-property bookmarks has one bookmark for the stream: it is given
+        to every property configured now (they were the ones synced, as far as state can tell),
+        except backfill_properties, so an upgrade pulls nothing again. From then on a property
+        without a bookmark is new and starts at start_date.
+        """
+        bookmarks = state.get(BOOKMARKS_KEY)
+        if bookmarks is not None or not self.time_dimension:
+            return dict(bookmarks or {})
+        legacy = state.get("replication_key_value")
+        if not legacy:
+            return {}
+        day = max(period_start(self.time_dimension, legacy), date(2019, 1, 1)).isoformat()
+        backfill = self._backfill_properties()
+        seeded = {property_id: day for property_id in property_ids if property_id not in backfill}
+        self.logger.info(
+            "Report %s: per-property bookmarks start from the stream's bookmark %s for %s",
+            self.name,
+            day,
+            ", ".join(sorted(seeded)) or "no property",
+        )
+        return seeded
+
+    def _backfill_properties(self) -> set[str]:
+        ids = self.config.get("backfill_properties") or []
+        return {str(p).strip().removeprefix("properties/") for p in ids}
+
+    def _bookmark_start(self, property_id: str, bookmarks: dict[str, str]) -> str:
+        """Return where this property starts.
+
+        start_date when it has no bookmark (new) or is listed in backfill_properties, else its
+        bookmark less the lookback.
+        """
+        if not self.time_dimension:
+            return self._snap(self._start_date())
+        bookmark = bookmarks.get(property_id)
+        if property_id in self._backfill_properties():
+            self.logger.info(
+                "Report %s: property %s backfills from start_date", self.name, property_id
+            )
+            return self._snap(self._start_date())
+        if not bookmark:
+            self.logger.info(
+                "Report %s: property %s has no bookmark; starting at start_date",
+                self.name,
+                property_id,
+            )
+            return self._snap(self._start_date())
+        return self._snap(max(date.fromisoformat(bookmark), date(2019, 1, 1)) - LOOKBACK)
 
     def _report_for_property(self, property_id: str) -> dict | None:
         """Return the report without the fields this property does not have.
@@ -282,9 +343,11 @@ class GoogleAnalyticsStream(Stream):
 
         property_ids = get_configured_property_ids(self.config)
 
-        state_filter = self._get_state_filter(context)
         state = self.get_context_state(context)
         progress: dict[str, str] = dict(state.get(PROGRESS_KEY) or {})
+        bookmarks = self._property_bookmarks(state, property_ids)
+        if self.time_dimension:
+            state[BOOKMARKS_KEY] = dict(bookmarks)
         end = date.fromisoformat(self.end_date)
 
         # Fetch data for each property; skip properties we no longer have access to
@@ -294,7 +357,8 @@ class GoogleAnalyticsStream(Stream):
             if property_report is None:
                 continue
             api_report_def = self._generate_report_definition(property_report)
-            start = self._property_start(property_id, state_filter, progress)
+            bookmark_start = self._bookmark_start(property_id, bookmarks)
+            start = self._property_start(property_id, bookmark_start, progress)
 
             try:
                 for window_start, window_end in self._windows(start, end):
@@ -304,6 +368,10 @@ class GoogleAnalyticsStream(Stream):
                     # Every row of the window is out: say so, so a run that stops later
                     # resumes this property after it.
                     progress[property_id] = window_end.isoformat()
+                    if self.time_dimension:
+                        done = max(bookmarks.get(property_id, ""), window_end.isoformat())
+                        bookmarks[property_id] = done
+                        state[BOOKMARKS_KEY] = dict(bookmarks)
                     self._checkpoint(state, progress)
             except Exception as e:
                 if is_permission_denied_error(e):
@@ -315,7 +383,7 @@ class GoogleAnalyticsStream(Stream):
                     continue
                 raise
 
-        # The stream finished: its bookmark (the SDK's) covers every property again.
+        # The stream finished: each property's bookmark says where its next run starts.
         state.pop(PROGRESS_KEY, None)
 
     def _windows(self, start: date, end: date) -> list[tuple[date, date]]:
